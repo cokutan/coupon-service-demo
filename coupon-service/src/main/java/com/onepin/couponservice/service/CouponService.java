@@ -16,6 +16,9 @@ import com.onepin.couponservice.model.CouponType;
 import com.onepin.couponservice.model.Redemption;
 import com.onepin.couponservice.repository.CouponRepository;
 import com.onepin.couponservice.repository.RedemptionRepository;
+import jakarta.annotation.PostConstruct;
+
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -57,6 +60,9 @@ public class CouponService {
   @Value("${megadeal.wait-timeout-seconds}")
   private int megadealWaitTimeoutSeconds;
 
+  @Value("${coupon.upload.max-batch-size}")
+  private int couponUploadMaxBatchSize;
+
   @Autowired
   public CouponService(
       CouponRepository couponRepository,
@@ -67,12 +73,22 @@ public class CouponService {
     this.redissonClient = redissonClient;
   }
 
+  @PostConstruct
+  public void init() {
+    RSemaphore semaphore = redissonClient.getSemaphore(MEGADEAL_CONCURRENT_KEY);
+    semaphore.trySetPermits(megadealConcurrentLimit);
+
+    RRateLimiter rateLimiter = redissonClient.getRateLimiter(MEGADEAL_RATE_LIMIT_KEY);
+    rateLimiter.trySetRate(
+        RateType.OVERALL, megadealRateLimit, megadealRateLimitSeconds, RateIntervalUnit.SECONDS);
+  }
+
   @Transactional
   public void uploadCoupons(List<CouponUploadDto> couponDtos) {
     logger.info("Uploading {} coupons", couponDtos.size());
-    if (couponDtos.size() > 50000) {
-      logger.error("Batch size {} exceeds limit of 50000", couponDtos.size());
-      throw new BatchSizeExceededException("Batch size exceeds limit of 50000");
+    if (couponDtos.size() > couponUploadMaxBatchSize) {
+      logger.error("Batch size {} exceeds limit of {}", couponDtos.size(), couponUploadMaxBatchSize);
+      throw new BatchSizeExceededException("Batch size exceeds limit of " + couponUploadMaxBatchSize);
     }
     List<Coupon> coupons =
         couponDtos.stream()
@@ -88,7 +104,7 @@ public class CouponService {
                         .currentUsages(0)
                         .build())
             .collect(Collectors.toList());
-    couponRepository.saveAll(coupons);
+    couponRepository.saveAllAndFlush(coupons);
     logger.info("Successfully uploaded {} coupons", coupons.size());
   }
 
@@ -107,16 +123,12 @@ public class CouponService {
     logger.debug("Handling MEGADEAL request for user: {}", request.getUserId());
 
     RSemaphore semaphore = redissonClient.getSemaphore(MEGADEAL_CONCURRENT_KEY);
-    semaphore.trySetPermits(megadealConcurrentLimit);
-
     RRateLimiter rateLimiter = redissonClient.getRateLimiter(MEGADEAL_RATE_LIMIT_KEY);
-    rateLimiter.trySetRate(
-        RateType.OVERALL, megadealRateLimit, megadealRateLimitSeconds, RateIntervalUnit.SECONDS);
 
     try {
-      if (semaphore.tryAcquire(megadealWaitTimeoutSeconds, TimeUnit.SECONDS)) {
+      if (semaphore.tryAcquire(Duration.ofSeconds(megadealWaitTimeoutSeconds))) {
         try {
-          if (rateLimiter.tryAcquire(1, megadealWaitTimeoutSeconds, TimeUnit.SECONDS)) {
+          if (rateLimiter.tryAcquire(1, Duration.ofSeconds(megadealWaitTimeoutSeconds))) {
             return generateCoupon(CouponType.MEGADEAL);
           } else {
             logger.warn("Rate limit exceeded for MEGADEAL coupon");

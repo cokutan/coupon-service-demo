@@ -10,19 +10,50 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.redisson.api.RRateLimiter;
+import org.redisson.api.RSemaphore;
+import org.redisson.api.RateIntervalUnit;
+import org.redisson.api.RateType;
+import org.redisson.api.RedissonClient;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MvcResult;
 
 @TestPropertySource(
-    properties = {"megadeal.wait-timeout-seconds=0", "megadeal.concurrent-limit=5"})
+    properties = {"megadeal.wait-timeout-seconds=0", "megadeal.concurrent-limit=1"})
 public class MegadealConcurrencyLimitTests extends BaseIntegrationTest {
+
+  @Autowired private RedissonClient redissonClient;
+
+  @Value("${megadeal.concurrent-limit}")
+  private int megadealConcurrentLimit;
+
+  @Value("${megadeal.rate-limit:10}")
+  private int megadealRateLimit;
+
+  @Value("${megadeal.rate-limit-seconds:1}")
+  private int megadealRateLimitSeconds;
+
+  @BeforeEach
+  void resetRateLimiters() {
+    RRateLimiter rateLimiter = redissonClient.getRateLimiter("megadeal:rate:limiter");
+    rateLimiter.delete();
+    rateLimiter.trySetRate(
+        RateType.OVERALL, megadealRateLimit, megadealRateLimitSeconds, RateIntervalUnit.SECONDS);
+
+    RSemaphore semaphore = redissonClient.getSemaphore("megadeal:semaphore");
+    semaphore.delete();
+    semaphore.trySetPermits(megadealConcurrentLimit);
+  }
 
   @Test
   void testMegadealConcurrencyLimiting_Failure() throws Exception {
     // Given
-    int concurrencyLimit = 5;
+    int concurrencyLimit = 1;
     int totalThreads = concurrencyLimit + 1;
 
     CountDownLatch readyLatch = new CountDownLatch(totalThreads);

@@ -6,81 +6,73 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import com.onepin.couponservice.dto.CouponRequestDto;
 import com.onepin.couponservice.exception.ErrorResponse;
 import com.onepin.couponservice.model.CouponType;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.redisson.api.RRateLimiter;
+import org.redisson.api.RSemaphore;
+import org.redisson.api.RateIntervalUnit;
+import org.redisson.api.RateType;
+import org.redisson.api.RedissonClient;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MvcResult;
 
-@TestPropertySource(
-    properties = {
-      "megadeal.wait-timeout-seconds=0",
-      "megadeal.concurrent-limit=20",
-      "megadeal.rate-limit=10"
-    })
-public class MegadealRateLimitTests extends BaseIntegrationTest {
+@TestPropertySource(properties = {
+        "megadeal.wait-timeout-seconds=0",
+        "megadeal.concurrent-limit=10",
+        "megadeal.rate-limit=1",
+})
+class MegadealRateLimitTests extends BaseIntegrationTest {
 
-  @Test
-  void testMegadealRateLimiting_ThrowsException() throws Exception {
-    // Given: Exhaust the rate limit
-    int rateLimit = 10;
-    int totalRequests = rateLimit + 1;
+    @Autowired
+    private RedissonClient redissonClient;
 
-    CountDownLatch readyLatch = new CountDownLatch(totalRequests);
-    CountDownLatch startLatch = new CountDownLatch(1);
-    CountDownLatch doneLatch = new CountDownLatch(totalRequests);
+    @BeforeEach
+    void resetRedisState() {
+        RRateLimiter rateLimiter = redissonClient.getRateLimiter("megadeal:rate:limiter");
+        rateLimiter.delete();
+        rateLimiter.trySetRate(
+                RateType.OVERALL, 1, 60, RateIntervalUnit.SECONDS
+        );
 
-    AtomicInteger successCount = new AtomicInteger(0);
-    AtomicInteger rateLimitCount = new AtomicInteger(0);
-
-    try (ExecutorService executor = Executors.newFixedThreadPool(totalRequests)) {
-      for (int i = 0; i < totalRequests; i++) {
-        int userId = i;
-        executor.submit(
-            () -> {
-              try {
-                readyLatch.countDown();
-                startLatch.await();
-
-                CouponRequestDto request = new CouponRequestDto();
-                request.setUserId("user-" + userId);
-                request.setType(CouponType.MEGADEAL);
-
-                MvcResult result =
-                    mockMvc
-                        .perform(
-                            post("/api/coupons/request")
-                                .contentType(MediaType.APPLICATION_JSON)
-                                .content(jsonMapper.writeValueAsString(request)))
-                        .andReturn();
-
-                if (result.getResponse().getStatus() == 200) {
-                  successCount.incrementAndGet();
-                } else {
-                  ErrorResponse error =
-                      jsonMapper.readValue(
-                          result.getResponse().getContentAsString(), ErrorResponse.class);
-                  assertEquals("RATE_LIMIT_EXCEEDED", error.getCode());
-                  rateLimitCount.incrementAndGet();
-                }
-
-              } catch (Exception e) {
-                throw new RuntimeException(e);
-              } finally {
-                doneLatch.countDown();
-              }
-            });
-      }
-
-      readyLatch.await(); // all threads ready
-      startLatch.countDown(); // fire at once
-      doneLatch.await(); // wait for completion
+        RSemaphore semaphore = redissonClient.getSemaphore("megadeal:semaphore");
+        semaphore.delete();
+        semaphore.trySetPermits(10);
     }
 
-    assertEquals(rateLimit, successCount.get());
-    assertEquals(1, rateLimitCount.get());
-  }
+    @Test
+    void secondRequestIsRateLimited_deterministic() throws Exception {
+        CouponRequestDto request = new CouponRequestDto();
+        request.setUserId("user-1");
+        request.setType(CouponType.MEGADEAL);
+
+        // 1️⃣ First request → SUCCESS
+        MvcResult first =
+                mockMvc.perform(
+                        post("/api/coupons/request")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(jsonMapper.writeValueAsString(request))
+                ).andReturn();
+
+        assertEquals(200, first.getResponse().getStatus());
+
+        // 2️⃣ Second request → RATE LIMITED
+        MvcResult second =
+                mockMvc.perform(
+                        post("/api/coupons/request")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(jsonMapper.writeValueAsString(request))
+                ).andReturn();
+
+        assertEquals(429, second.getResponse().getStatus());
+
+        ErrorResponse error =
+                jsonMapper.readValue(
+                        second.getResponse().getContentAsString(),
+                        ErrorResponse.class
+                );
+
+        assertEquals("RATE_LIMIT_EXCEEDED", error.getCode());
+    }
 }
